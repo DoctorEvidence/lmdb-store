@@ -1658,6 +1658,8 @@ struct MDB_env {
 	unsigned short me_esumsize;	/**< size of per-page authentication data */
 	unsigned int me_rpcheck;
 
+	MDB_flush_func *me_flushfunc;	/**< flush data */
+	void *me_flushdata;	/**< flush data */
 	MDB_enc_func *me_encfunc;	/**< encrypt env data */
 	MDB_val		me_enckey;	/**< key for env encryption */
 #endif
@@ -2539,7 +2541,9 @@ static txnid_t
 mdb_find_oldest(MDB_txn *txn)
 {
 	int i;
-	txnid_t mr, oldest = txn->mt_txnid - 1;
+	/* <lmdb-store> */
+	txnid_t mr, oldest = txn->mt_txnid - ((txn->mt_env->me_flags & MDB_OVERLAPPINGSYNC) ? 2 : 1);
+	/* </lmdb-store> */
 	if (txn->mt_env->me_txns) {
 		MDB_reader *r = txn->mt_env->me_txns->mti_readers;
 		for (i = txn->mt_env->me_txns->mti_numreaders; --i >= 0; ) {
@@ -4178,7 +4182,7 @@ retry_seek:
 	CACHEFLUSH(env->me_map, txn->mt_next_pgno * env->me_psize, DCACHE);
 
 #ifdef _WIN32
-	if (!F_ISSET(env->me_flags, MDB_NOSYNC)) {
+	if (!F_ISSET(env->me_flags, MDB_NOSYNC|MDB_OVERLAPPINGSYNC)) {
 		/* Now wait for all the asynchronous/overlapped sync/write-through writes to complete.
 		* We start with the last one so that all the others should already be complete and
 		* we reduce thread suspend/resuming (in practice, typically about 99.5% of writes are
@@ -4444,7 +4448,15 @@ mdb_txn_commit(MDB_txn *txn)
 		rc = MDB_PROBLEM; /* mt_loose_pgs does not match dirty_list */
 		goto fail;
 	}
-	if (!F_ISSET(txn->mt_flags, MDB_TXN_NOSYNC) &&
+	/* <lmdb-store> */
+	// TODO: At some point, we may see if we can further consolidate lmdb-store actions into this single external
+	// flushfunc that calls back to mdb_page_flush we before and after actions
+	if (env->me_flushfunc) {
+		env->me_flushfunc(env->me_flushdata);
+	}
+	/* </lmdb-store> */
+
+	if (!F_ISSET(txn->mt_flags, MDB_TXN_NOSYNC|MDB_OVERLAPPINGSYNC) &&
 		(rc = mdb_env_sync0(env, 0, txn->mt_next_pgno)))
 		goto fail;
 	if ((rc = mdb_env_write_meta(txn)))
@@ -6098,6 +6110,7 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 		rc = mdb_env_setup_locks(env, &fname, mode, &excl);
 		if (rc)
 			goto leave;
+		fprintf(stderr, "Exclusive value is %u \n", excl);
 		if ((flags & MDB_PREVSNAPSHOT) && !excl) {
 			rc = EAGAIN;
 			goto leave;
@@ -11404,6 +11417,10 @@ mdb_env_set_assert(MDB_env *env, MDB_assert_func *func)
 	env->me_assert_func = func;
 #endif
 	return MDB_SUCCESS;
+}
+
+int mdb_env_set_flush(MDB_env *env, MDB_flush_func *func) {
+	env->me_flushfunc = func;
 }
 
 #if MDB_RPAGE_CACHE

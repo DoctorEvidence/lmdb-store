@@ -35,6 +35,9 @@ thread_local Nan::Persistent<Function>* EnvWrap::dbiCtor;
 uv_mutex_t* EnvWrap::envsLock = EnvWrap::initMutex();
 std::vector<env_path_t> EnvWrap::envs;
 
+//uv_mutex_t* EnvWrap::syncThreadsLock = EnvWrap::initMutex();
+//std::vector<void*> EnvWrap::syncThreads;
+
 uv_mutex_t* EnvWrap::initMutex() {
     uv_mutex_t* mutex = new uv_mutex_t;
     uv_mutex_init(mutex);
@@ -430,6 +433,37 @@ MDB_txn* EnvWrap::getReadTxn() {
     readTxnRenewed = true;
     return txn;
 }
+static uv_cond_t* flushCond;
+static uv_mutex_t* flushLock;
+
+void EnvWrap::SyncRunner(void* arg) {
+    EnvWrap* ew = (EnvWrap*) arg;
+    do {
+        mdb_env_sync(ew->env, 1);
+        uv_mutex_lock(flushLock);
+        uv_cond_signal(flushCond);
+        uv_mutex_unlock(flushLock);        
+    } while(false); // TODO: continually run this
+}
+
+// this is can be called when a transaction begins if there is no existing sync taking place
+int EnvWrap::BeginOrResumeSync(MDB_txn* txn) {
+    int txnId = mdb_txn_id(txn);
+    // TODO: if txnId matches the current sync, we can just let it keep going, otherwise replace it.
+    // Also the thread syncing pool is be shared across all threads
+    uv_thread_t tid;
+    // TODO: Use existing thread if available
+    int rc = /*currentThread || */uv_thread_create(&tid, SyncRunner, mdb_txn_env(txn));
+    return rc;
+}
+
+static int OverlappingFlush(void* data) {
+    EnvWrap* ew = ((EnvWrap*) data);
+    uv_mutex_lock(flushLock);
+    uv_cond_wait(flushCond, flushLock);
+    uv_mutex_unlock(flushLock);
+    return 0;
+}
 #ifdef MDB_RPAGE_CACHE
 static int encfunc(const MDB_val* src, MDB_val* dst, const MDB_val* key, int encdec)
 {
@@ -548,6 +582,7 @@ NAN_METHOD(EnvWrap::open) {
     setFlagFromValue(&flags, MDB_PREVSNAPSHOT, "usePreviousSnapshot", false, options);
     setFlagFromValue(&flags, MDB_NOMEMINIT , "noMemInit", false, options);
     setFlagFromValue(&flags, MDB_NORDAHEAD , "noReadAhead", false, options);
+    setFlagFromValue(&flags, MDB_OVERLAPPINGSYNC, "overlappingSync", false, options);
     setFlagFromValue(&flags, MDB_NOMETASYNC, "noMetaSync", false, options);
     setFlagFromValue(&flags, MDB_NOSYNC, "noSync", false, options);
     setFlagFromValue(&flags, MDB_MAPASYNC, "mapAsync", false, options);
@@ -561,6 +596,10 @@ NAN_METHOD(EnvWrap::open) {
         }
     #endif
     #endif
+    if (flags & MDB_OVERLAPPINGSYNC) {
+        flags |= MDB_PREVSNAPSHOT;
+        mdb_env_set_flush(ew->env, OverlappingFlush);
+    }
 
     if (flags & MDB_NOLOCK) {
         fprintf(stderr, "You chose to use MDB_NOLOCK which is not officially supported by node-lmdb. You have been warned!\n");
@@ -569,11 +608,19 @@ NAN_METHOD(EnvWrap::open) {
     // Set MDB_NOTLS to enable multiple read-only transactions on the same thread (in this case, the nodejs main thread)
     flags |= MDB_NOTLS;
     // TODO: make file attributes configurable
-    #if NODE_VERSION_AT_LEAST(12,0,0)
     rc = mdb_env_open(ew->env, *String::Utf8Value(Isolate::GetCurrent(), path), flags, 0664);
-    #else
-    rc = mdb_env_open(ew->env, *String::Utf8Value(path), flags, 0664);
-    #endif
+    if (flags & MDB_PREVSNAPSHOT) {
+        if (rc == EAGAIN) {
+            fprintf(stderr, "EAGAIN after usePreviousSnapshot, will start without\n");
+            flags &= ~MDB_PREVSNAPSHOT;
+            rc = mdb_env_open(ew->env, *String::Utf8Value(Isolate::GetCurrent(), path), flags, 0664);
+        } else if (!rc) {
+            fprintf(stderr, "Opened with previous snapshot, writing initial txn to clear last txn\n");
+            MDB_txn* txn;
+            mdb_txn_begin(ew->env, nullptr, 0, &txn);
+            mdb_txn_commit(txn);
+        }
+    }
 
     if (rc != 0) {
         mdb_env_close(ew->env);
@@ -1144,7 +1191,7 @@ void EnvWrap::setupExports(Local<Object> exports) {
           v8::Local<v8::Signature>(), 0, v8::ConstructorBehavior::kThrow,
           v8::SideEffectType::kHasNoSideEffect));
     #endif
-    dbiTpl->PrototypeTemplate()->Set(isolate, "getByPrimitive", Nan::New<FunctionTemplate>(DbiWrap::getByPrimitive));
+    dbiTpl->PrototypeTemplate()->Set(isolate, "compareKeys", Nan::New<FunctionTemplate>(DbiWrap::compareKeys));
     dbiTpl->PrototypeTemplate()->Set(isolate, "getStringByPrimitive", Nan::New<FunctionTemplate>(DbiWrap::getStringByPrimitive));
     dbiTpl->PrototypeTemplate()->Set(isolate, "stat", Nan::New<FunctionTemplate>(DbiWrap::stat));
 
